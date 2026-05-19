@@ -1,0 +1,10 @@
+{
+  "kernel_version": "6.17.0-23-generic",
+  "uptime_seconds": 2039,
+  "uptime_human": "0h 33m 59s",
+  "memory_total_mb": 15614,
+  "memory_free_mb": 7060,
+  "load_avg_1m": 0.62,
+  "hostname": "kali",
+  "timestamp": "2026-05-15T13:43:49Z"
+}

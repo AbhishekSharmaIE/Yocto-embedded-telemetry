@@ -1,0 +1,46 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          bootinfo-server
+# Required-Start:    $network
+# Required-Stop:     $network
+# Default-Start:     S
+# Default-Stop:      0 6
+# Short-Description: Bootinfo HTTP diagnostics server
+### END INIT INFO
+
+DAEMON=/usr/bin/bootinfo-server
+PIDFILE=/var/run/bootinfo-server.pid
+NAME=bootinfo-server
+
+case "$1" in
+start)
+	echo "Starting $NAME..."
+	start-stop-daemon --start --background \
+		--make-pidfile --pidfile "$PIDFILE" \
+		--exec "$DAEMON"
+	;;
+stop)
+	echo "Stopping $NAME..."
+	start-stop-daemon --stop --pidfile "$PIDFILE"
+	rm -f "$PIDFILE"
+	;;
+restart)
+	"$0" stop
+	sleep 1
+	"$0" start
+	;;
+status)
+	if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+		echo "$NAME is running (PID $(cat "$PIDFILE"))"
+	else
+		echo "$NAME is not running"
+		exit 1
+	fi
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart|status}"
+	exit 1
+	;;
+esac
+
+exit 0

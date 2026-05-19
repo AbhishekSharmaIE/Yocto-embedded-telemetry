@@ -1,458 +1,302 @@
-# Lightweight Yocto Embedded Telemetry
+# Technical documentation
 
-> **Repo:** `yocto-embedded-telemetry`  
-> **Stack:** Yocto layer (Kirkstone-compatible), C, BitBake recipes, native Linux test, optional QEMU  
-> **Goal:** A small, credible embedded-Linux portfolio project — custom layer + C telemetry daemon — without keeping 50+ GB of Poky build artifacts on your machine.
+System design, component reference, and integration guide for **yocto-embedded-telemetry**.
 
 ---
 
-## Table of Contents
+## Table of contents
 
-1. [What This Project Is](#1-what-this-project-is)
-2. [Lightweight Workflow](#2-lightweight-workflow)
-3. [Architecture](#3-architecture)
-4. [Repository Layout](#4-repository-layout)
-5. [Phase 0 — Bootstrap the Repo](#phase-0--bootstrap-the-repo)
-6. [Phase 1 — C Telemetry Daemon](#phase-1--c-telemetry-daemon)
-7. [Phase 2 — Yocto Layer & Recipe](#phase-2--yocto-layer--recipe)
-8. [Phase 3 — Native Test (No Full Image Build)](#phase-3--native-test-no-full-image-build)
-9. [Phase 4 — Optional Full Build & QEMU](#phase-4--optional-full-build--qemu)
-10. [API Reference](#10-api-reference)
-11. [Troubleshooting](#11-troubleshooting)
-12. [README Outline](#12-readme-outline)
+1. [Overview](#overview)
+2. [System architecture](#system-architecture)
+3. [Components](#components)
+4. [Boot and runtime](#boot-and-runtime)
+5. [API reference](#api-reference)
+6. [Host development](#host-development)
+7. [Yocto integration](#yocto-integration)
+8. [Operations](#operations)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
-## 1. What This Project Is
+## Overview
 
-You ship a **custom Yocto layer** (`meta-mysoftware`) that packages a tiny **C HTTP server** (`bootinfo-server`). On boot (in a real image), it listens on port **8000** and serves system diagnostics as JSON:
+**bootinfo-server** is a single-threaded C process that listens on TCP port **8000** and answers HTTP `GET /bootinfo` with a JSON document of live system metrics. It is intended for embedded Linux products where a small, dependency-free diagnostics endpoint is useful for bring-up, monitoring, or factory test.
 
-```http
-GET /bootinfo HTTP/1.1
-```
+The service is delivered in two forms:
 
-```json
-{
-  "kernel_version": "6.1.0-yocto-standard",
-  "uptime_seconds": 142,
-  "uptime_human": "0h 2m 22s",
-  "memory_total_mb": 512,
-  "memory_free_mb": 387,
-  "load_avg_1m": 0.12,
-  "hostname": "qemux86-64",
-  "timestamp": "2026-05-15T09:41:03Z"
-}
-```
-
-**What you prove (without a local monster build):**
-
-| Skill | How |
-|-------|-----|
-| Yocto / BitBake | Valid `layer.conf`, `.bb` recipe, image `.bbappend` |
-| Embedded C | Sockets, `sysinfo(2)`, `uname(2)`, minimal HTTP |
-| Linux deployment | Init script or systemd unit, auto-start at boot |
-| Debugging | Native compile + `curl` before cross-build |
-
-**Disk budget (tracked in Git):** ~10–30 MB.  
-**Not in Git:** `poky/`, `build/`, `downloads/`, `sstate-cache/` (tens of GB if you run a full image build).
+| Delivery | Use case |
+|----------|----------|
+| **Native build** (`native-test/`) | Develop and validate on the host without Poky |
+| **Yocto package** (`meta-mysoftware/`) | Install into `core-image-minimal` (or custom image) for target deployment |
 
 ---
 
-## 2. Lightweight Workflow
+## System architecture
 
-Default path — use this unless you have a cloud VM with plenty of disk:
+### End-to-end
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  ON YOUR LAPTOP (always)                                     │
-│                                                              │
-│  1. meta-mysoftware/     ← layer, recipe, C source, init     │
-│  2. native-test/         ← Makefile, gcc, curl validation    │
-│  3. docs/                ← architecture, expected bitbake    │
-│  4. README.md            ← build story + API                 │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ optional, once
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  CLOUD VM / LAB MACHINE (Codespaces, EC2, NCI, …)            │
-│                                                              │
-│  shallow clone poky → bitbake core-image-minimal             │
-│  runqemu + screenshots → delete VM / rm build/tmp            │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────┐         ┌─────────────────────────────────┐
+│  Build host         │         │  Target device                   │
+│  (BitBake / gcc)    │         │                                  │
+│                     │         │  Linux kernel                    │
+│  meta-mysoftware    │──build─►│       ↓                          │
+│    .bb + sources    │         │  /sbin/init (SysVinit)           │
+│                     │         │       ↓                          │
+│  native-test/       │──dev───►│  /etc/init.d/bootinfo-server     │
+│    (optional)       │         │       ↓                          │
+└─────────────────────┘         │  /usr/bin/bootinfo-server :8000  │
+                                │       ↓                          │
+                                │  GET /bootinfo → JSON            │
+                                └─────────────────────────────────┘
 ```
 
-| Approach | Disk on laptop | When to use |
-|----------|----------------|-------------|
-| **Native test only** | &lt; 50 MB | Daily dev, interviews, GitHub |
-| **Shallow Poky + single recipe** | ~2–5 GB temp | `bitbake bootinfo-server` only (no image) |
-| **Full image + QEMU** | 30–80 GB | One-time proof screenshots in cloud |
+### Request handling (daemon)
 
-**Do not** commit `poky/`, `build/tmp`, or deploy images. Put them in `.gitignore`.
+```
+accept loop
+    └── read HTTP request line
+            ├── GET /bootinfo  → build_json() → HTTP 200 + JSON body
+            └── otherwise      → HTTP 404
+```
+
+`build_json()` collects:
+
+| Data | Linux API |
+|------|-----------|
+| Kernel release | `uname(2)` |
+| Uptime, memory, load | `sysinfo(2)` |
+| Hostname | `gethostname(2)` |
+| Timestamp | `time(2)` + `gmtime` + `strftime` (UTC ISO 8601) |
+
+Load average uses `si.loads[0] / 65536.0` per `sysinfo` documentation.
 
 ---
 
-## 3. Architecture
+## Components
 
-### 3.1 End-to-end (target system)
-
-```
-Host (Ubuntu)                         Target (QEMU or board)
-────────────────                      ─────────────────────
-  meta-mysoftware/                          Linux + init
-       │                                        │
-       ▼                                        ▼
-  BitBake recipe ──cross-compile──►  /usr/bin/bootinfo-server
-       │                             /etc/init.d/bootinfo-server
-       │                                        │
-       └────────────────────────────────────────┘
-                              │
-                    GET :8000/bootinfo → JSON
-```
-
-### 3.2 Layer layout
+### Custom layer: `meta-mysoftware`
 
 ```
 meta-mysoftware/
-├── conf/
-│   └── layer.conf
-├── recipes-core/images/
-│   └── core-image-minimal.bbappend    # IMAGE_INSTALL:append = " bootinfo-server"
+├── conf/layer.conf
+├── recipes-core/images/core-image-minimal.bbappend
 └── recipes-myapps/bootinfo-server/
     ├── bootinfo-server.bb
     └── files/
         ├── bootinfo-server.c
-        └── bootinfo-server.init       # SysVinit (matches core-image-minimal)
+        └── bootinfo-server.init
 ```
 
-### 3.3 Daemon internals
+| File | Role |
+|------|------|
+| `layer.conf` | Registers the layer; `BBFILE_PRIORITY_mysoftware = "10"`; Kirkstone compatibility |
+| `bootinfo-server.bb` | Fetches sources, cross-compiles, installs binary and init script |
+| `core-image-minimal.bbappend` | `IMAGE_INSTALL:append = " bootinfo-server"` |
+| `bootinfo-server.c` | Daemon implementation |
+| `bootinfo-server.init` | SysVinit start/stop/status via `start-stop-daemon` |
 
-```
-bootinfo-server (port 8000, single-threaded)
-├── socket → bind → listen → accept loop
-├── handle_client()
-│   ├── GET /bootinfo  → build_json() → HTTP 200
-│   └── else           → HTTP 404
-└── build_json()
-    ├── uname(2)      → kernel_version
-    ├── sysinfo(2)    → uptime, memory, load_avg_1m
-    ├── gethostname() → hostname
-    └── time/strftime → timestamp (UTC ISO 8601)
-```
+### BitBake recipe summary
 
-### 3.4 Boot (when running a real image)
+- **License:** MIT
+- **Init:** `inherit update-rc.d` — start priority **99** in runlevel **S**
+- **Install paths:** `${bindir}/bootinfo-server`, `${sysconfdir}/init.d/bootinfo-server`
+- **Compile:** `${CC} ${CFLAGS} ${LDFLAGS}` on `bootinfo-server.c` (no hardcoded `gcc`)
 
-```
-kernel → /sbin/init → … → S99bootinfo-server → /usr/bin/bootinfo-server &
-```
+### Native test harness
+
+| File | Role |
+|------|------|
+| `native-test/Makefile` | Builds daemon from the same `.c` used in the recipe |
+| `native-test/run.sh` | Build, background start, `curl` smoke test, clean shutdown |
+| `scripts/verify.sh` | Validates layer file presence + runs `run.sh` |
 
 ---
 
-## 4. Repository Layout
+## Boot and runtime
+
+On a Yocto `core-image-minimal` target with SysVinit:
 
 ```
-yocto-embedded-telemetry/
-├── README.md
-├── .gitignore
-├── meta-mysoftware/              # tracked — your Yocto layer
-├── native-test/
-│   ├── Makefile
-│   └── run.sh                    # build, run, curl /bootinfo
-├── docs/
-│   ├── architecture.md           # copy/summary of §3
-│   ├── expected-build-output.md  # sample bitbake lines (no tmp/)
-│   ├── troubleshooting.md
-│   └── screenshots/              # curl, ps, optional QEMU
-└── scripts/
-    └── setup-host.sh             # apt deps for native + optional Yocto
+kernel mount rootfs
+    → /sbin/init
+    → … network (Required-Start: $network)
+    → S99bootinfo-server
+    → /usr/bin/bootinfo-server (background, PID file /var/run/bootinfo-server.pid)
 ```
 
-**.gitignore (minimum):**
-
-```gitignore
-poky/
-build/
-downloads/
-*.sstate-cache/
-.DS_Store
-.vscode/
-*.log
-native-test/bootinfo-server
-```
-
----
-
-## Phase 0 — Bootstrap the Repo
-
-**Time:** ~15 min
+**Service control on target:**
 
 ```bash
-mkdir -p yocto-embedded-telemetry/{meta-mysoftware/conf,native-test,docs/screenshots,scripts}
-cd yocto-embedded-telemetry
-git init && git branch -M main
-# add .gitignore (above)
-git add . && git commit -m "chore: initialise lightweight yocto telemetry repo"
+/etc/init.d/bootinfo-server start|stop|restart|status
+```
+
+**Verify on target:**
+
+```bash
+wget -qO- http://127.0.0.1:8000/bootinfo
+# or
+curl -s http://127.0.0.1:8000/bootinfo
 ```
 
 ---
 
-## Phase 1 — C Telemetry Daemon
+## API reference
 
-**Time:** ~1–2 h  
-**Location:** `meta-mysoftware/recipes-myapps/bootinfo-server/files/bootinfo-server.c`
+### `GET /bootinfo`
 
-Implement a minimal TCP server:
+**Success — 200 OK**
 
-- Port **8000**, `SO_REUSEADDR`
-- Only **`GET /bootinfo`** → JSON body, `Content-Type: application/json`
-- Diagnostics via **`sysinfo(2)`**, **`uname(2)`**, **`gethostname(2)`**
-- Load average: `si.loads[0] / 65536.0`
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: <n>
+Connection: close
 
-**SysVinit script** (`bootinfo-server.init`): start at runlevel S after `$network`, using `start-stop-daemon`, PID file under `/var/run/`.
+{
+  "kernel_version": "<string>",
+  "uptime_seconds": <int>,
+  "uptime_human": "<string>",
+  "memory_total_mb": <int>,
+  "memory_free_mb": <int>,
+  "load_avg_1m": <float>,
+  "hostname": "<string>",
+  "timestamp": "<ISO8601 UTC>"
+}
+```
 
-**Quick native sanity check** (before any Yocto):
+**Not found — 404**
+
+Any path other than `/bootinfo` returns plain text: `Not Found. Try GET /bootinfo`.
+
+### Field reference
+
+| Field | Type | Source |
+|-------|------|--------|
+| `kernel_version` | string | `uname(2).release` |
+| `uptime_seconds` | integer | `sysinfo(2).uptime` |
+| `uptime_human` | string | Derived `Hh Mm Ss` |
+| `memory_total_mb` | integer | `totalram * mem_unit` |
+| `memory_free_mb` | integer | `freeram * mem_unit` |
+| `load_avg_1m` | float | `loads[0] / 65536` |
+| `hostname` | string | `gethostname(2)` |
+| `timestamp` | string | Server UTC time at response |
+
+---
+
+## Host development
+
+### Prerequisites
 
 ```bash
-cd meta-mysoftware/recipes-myapps/bootinfo-server/files
-gcc -Wall -o bootinfo-server bootinfo-server.c
-./bootinfo-server &
+sudo ./scripts/setup-native.sh   # build-essential, curl, python3, make
+```
+
+### Build and test
+
+```bash
+./native-test/run.sh             # automated smoke test
+./scripts/verify.sh              # layer check + smoke test
+```
+
+### Manual run
+
+```bash
+cd native-test && make && ./bootinfo-server
 curl -s http://127.0.0.1:8000/bootinfo | python3 -m json.tool
-kill %1
 ```
 
-Commit: `feat: add bootinfo-server C daemon and init script`
+The repository intentionally does not include Poky or build artifacts. Host development validates logic, HTTP behaviour, and JSON output before target integration.
 
 ---
 
-## Phase 2 — Yocto Layer & Recipe
+## Yocto integration
 
-**Time:** ~1 h
+Perform these steps on a build host with [Yocto Project](https://www.yoctoproject.org/) **Kirkstone** (Poky) installed.
 
-### `conf/layer.conf`
+### 1. Register the layer
 
-```bitbake
-BBPATH .= ":${LAYERDIR}"
-BBFILES += "${LAYERDIR}/recipes-*/*/*.bb \
-            ${LAYERDIR}/recipes-*/*/*.bbappend"
-BBFILE_COLLECTIONS += "mysoftware"
-BBFILE_PATTERN_mysoftware = "^${LAYERDIR}/"
-BBFILE_PRIORITY_mysoftware = "10"
-LAYERDEPENDS_mysoftware = "core"
-LAYERSERIES_COMPAT_mysoftware = "kirkstone"
-```
-
-### `bootinfo-server.bb` (essentials)
-
-- `SRC_URI` = `file://bootinfo-server.c` + `file://bootinfo-server.init`
-- `inherit update-rc.d`
-- `INITSCRIPT_NAME = "bootinfo-server"`
-- `INITSCRIPT_PARAMS = "start 99 S . stop 10 0 6 ."`
-- `do_compile`: `${CC} ${CFLAGS} ${LDFLAGS} ${S}/bootinfo-server.c -o ${S}/bootinfo-server`
-- `do_install`: binary → `${D}${bindir}`, init → `${D}${sysconfdir}/init.d`
-- `LICENSE = "MIT"` + correct `LIC_FILES_CHKSUM`
-
-### `core-image-minimal.bbappend`
+Add the absolute path to `meta-mysoftware` in `build/conf/bblayers.conf`:
 
 ```bitbake
-IMAGE_INSTALL:append = " bootinfo-server"
+BBLAYERS ?= " \
+  /path/to/yocto-embedded-telemetry/meta-mysoftware \
+  ${TOPDIR}/../poky/meta \
+  ${TOPDIR}/../poky/meta-poky \
+  ${TOPDIR}/../poky/meta-yocto-bsp \
+  "
 ```
 
-Commit: `feat: add meta-mysoftware layer and bootinfo-server recipe`
-
-You do **not** need a successful `bitbake core-image-minimal` on your laptop for this commit to be meaningful — the layer structure and recipe are the artifact.
-
----
-
-## Phase 3 — Native Test (No Full Image Build)
-
-**Time:** ~30 min  
-**Purpose:** Prove the daemon and API on real Linux APIs.
-
-### `native-test/Makefile`
-
-```makefile
-SRC = ../meta-mysoftware/recipes-myapps/bootinfo-server/files/bootinfo-server.c
-CC ?= gcc
-CFLAGS += -Wall -Wextra
-
-bootinfo-server: $(SRC)
-	$(CC) $(CFLAGS) -o $@ $<
-
-run: bootinfo-server
-	./bootinfo-server
-
-clean:
-	rm -f bootinfo-server
-```
-
-### `native-test/run.sh`
+Verify:
 
 ```bash
-#!/bin/bash
-set -euo pipefail
-cd "$(dirname "$0")"
-make -q bootinfo-server 2>/dev/null || make
-./bootinfo-server &
-PID=$!
-trap 'kill "$PID" 2>/dev/null' EXIT
-sleep 0.5
-curl -sf http://127.0.0.1:8000/bootinfo | python3 -m json.tool
-echo "OK: /bootinfo returned valid JSON"
+bitbake-layers show-layers | grep mysoftware
 ```
+
+### 2. Build the package
 
 ```bash
-chmod +x native-test/run.sh
-./native-test/run.sh
+source oe-init-build-env build
+bitbake bootinfo-server
 ```
 
-Save sample output under `docs/sample-bootinfo.json`. Optional screenshot of `curl` → `docs/screenshots/`.
-
-Commit: `test: add native build and curl smoke test`
-
----
-
-## Phase 4 — Optional Full Build & QEMU
-
-Only when you have **~50 GB free** and **several hours** (use a cloud VM if your laptop is tight).
-
-### One-time host setup
+### 3. Build an image (optional)
 
 ```bash
-./scripts/setup-host.sh   # gawk, python3, chrpath, etc. — see Yocto manual
-```
-
-### Shallow Poky (saves clone size)
-
-```bash
-git clone --depth=1 --branch kirkstone https://git.yoctoproject.org/poky
-cd poky && source oe-init-build-env ../build
-```
-
-### `build/conf/local.conf` (minimal)
-
-```bitbake
+# build/conf/local.conf
 MACHINE ?= "qemux86-64"
-BB_NUMBER_THREADS ?= "${@oe.utils.cpu_count()}"
-PARALLEL_MAKE ?= "-j ${@oe.utils.cpu_count()}"
-INHERIT += "rm_work"
+
+bitbake core-image-minimal
 ```
 
-### Register layer
+Deploy artifacts appear under `tmp/deploy/images/<MACHINE>/`.
 
-In `build/conf/bblayers.conf`, add the **absolute** path to `meta-mysoftware`, plus standard `meta`, `meta-poky`, `meta-yocto-bsp`.
-
-```bash
-bitbake-layers show-layers    # must list mysoftware
-```
-
-### Build options (lightest → heaviest)
-
-| Command | Purpose |
-|---------|---------|
-| `bitbake bootinfo-server` | Cross-compile package only |
-| `bitbake core-image-minimal` | Full image (large) |
-
-### QEMU smoke test
+### 4. QEMU validation (optional)
 
 ```bash
 runqemu qemux86-64 nographic
-# login: root (no password on minimal image)
+# guest login: root (empty password on minimal image)
 wget -qO- http://127.0.0.1:8000/bootinfo
 ```
 
-Port forward from host (optional):
+Host port forward (optional):
 
 ```bash
 runqemu qemux86-64 nographic slirp "hostfwd=tcp::8000-:8000"
 curl -s http://127.0.0.1:8000/bootinfo
 ```
 
-### Clean up after proof
+### Host toolchain packages (full Yocto builds)
 
-```bash
-rm -rf build/tmp build/sstate-cache build/downloads
-# optional: rm -rf poky
-```
-
-Document commands and **expected** log snippets in `docs/expected-build-output.md` — not multi-GB `tmp/` folders.
+For machines that run BitBake, use `scripts/setup-host.sh` to install the Yocto recommended host packages. This is separate from `scripts/setup-native.sh`, which only supports host-side daemon development.
 
 ---
 
-## 10. API Reference
+## Operations
 
-### `GET /bootinfo`
+| Item | Value |
+|------|--------|
+| Listen address | `0.0.0.0` |
+| Port | `8000` |
+| Process model | Single-threaded, blocking `accept` |
+| Connections | One client per accept; connection closed after response |
+| Logging | `printf` on bind/listen (stdout) |
 
-| Field | Type | Source |
-|-------|------|--------|
-| `kernel_version` | string | `uname(2)` release |
-| `uptime_seconds` | int | `sysinfo(2).uptime` |
-| `uptime_human` | string | derived |
-| `memory_total_mb` | int | `sysinfo(2)` RAM |
-| `memory_free_mb` | int | `sysinfo(2)` free RAM |
-| `load_avg_1m` | float | `loads[0] / 65536` |
-| `hostname` | string | `gethostname(2)` |
-| `timestamp` | string | UTC ISO 8601 |
-
-Any other path → **404** with plain text body.
+**Resource profile:** Suitable for minimal embedded images — one binary, no linked libraries beyond libc.
 
 ---
 
-## 11. Troubleshooting
+## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| `No recipes available for bootinfo-server` | Layer not in `bblayers.conf` | Add path; `bitbake-layers show-layers` |
-| `do_compile`: file not found | Wrong `SRC_URI` / missing `files/` | Match recipe dir layout |
-| QA: installed to wrong directory | Bad `${D}` paths | Use `${D}${bindir}`, `${D}${sysconfdir}/init.d` |
-| Server not running after boot | Init not executable / rc.d | `install -m 0755`; check `update-rc.d` |
-| `curl` fails on host | No port forward | Test inside guest or use `hostfwd` |
-| `LIC_FILES_CHKSUM` error | MIT checksum | Use md5 from `${COMMON_LICENSE_DIR}/MIT` |
-| Native `bind: Address in use` | Old process on 8000 | `fuser -k 8000/tcp` or change `PORT` |
+| Symptom | Cause | Resolution |
+|---------|-------|------------|
+| `bind: Address already in use` | Port 8000 occupied | `fuser -k 8000/tcp` or stop existing instance |
+| `curl: connection refused` | Daemon not running | `./native-test/run.sh` or start binary manually |
+| BitBake: no recipe `bootinfo-server` | Layer not in `BBLAYERS` | Add `meta-mysoftware` path; run `bitbake-layers show-layers` |
+| `do_compile`: source not found | `SRC_URI` / `files/` mismatch | Ensure `files/bootinfo-server.c` exists beside `.bb` |
+| QA install path errors | Incorrect `${D}` usage | Use `${D}${bindir}`, `${D}${sysconfdir}/init.d` |
+| Service missing after boot | Init permissions / rc.d | Recipe must `install -m 0755`; confirm `update-rc.d` inherit |
+| `LIC_FILES_CHKSUM` mismatch | Wrong MIT checksum | Use OE-Core `COMMON_LICENSE_DIR` MIT md5 |
+| QEMU: cannot reach service from host | No port forward | Use `hostfwd` or test inside guest |
 
----
-
-## 12. README Outline
-
-Use this structure for `README.md` (keep it short; link to this file for phases):
-
-1. **One-liner** — Yocto layer + C JSON telemetry on `/bootinfo`
-2. **Quick start** — `./native-test/run.sh` (no Poky required)
-3. **Architecture** — small diagram (layer → recipe → binary)
-4. **Optional full build** — link to Phase 4; note disk/RAM needs
-5. **API table** — fields from §10
-6. **License** — MIT
-
-### Suggested commit history
-
-```
-chore: initialise lightweight yocto telemetry repo
-feat: add bootinfo-server C daemon and init script
-feat: add meta-mysoftware layer and bootinfo-server recipe
-test: add native build and curl smoke test
-docs: architecture, sample JSON, optional build notes
-```
-
-Tag `v1.0.0` when native test passes and layer/recipe are complete — full QEMU proof is optional.
-
----
-
-## Interview talking points
-
-- **Why lightweight:** Yocto proves BSP workflow; native test proves C and Linux APIs without 60 GB on disk.
-- **`${CC}` in recipes:** never hardcode `gcc` — BitBake sets the cross-compiler.
-- **`${D}` vs `${S}`:** `${S}` is build dir; `${D}` is staged rootfs for packaging.
-- **sstate-cache:** after one cloud build, incremental recipe rebuilds are fast — delete `tmp` when done.
-- **Production angle:** same pattern as ECU/edge diagnostics — small daemon, JSON over HTTP, starts at boot.
-
----
-
-## Resource limits (honest)
-
-| Resource | Native-only repo | Full `core-image-minimal` |
-|----------|------------------|---------------------------|
-| Git repo size | ~10–30 MB | +0 (don't commit images) |
-| Local disk | &lt; 50 MB | 30–80 GB typical |
-| RAM | 2 GB OK | 8–16 GB recommended |
-| Time | minutes | hours (first build) |
-
-**Bottom line:** Treat the **layer + recipe + working C daemon + native test** as the product. Treat a full Poky image build as optional evidence, usually done once in the cloud.
+Additional notes: [docs/troubleshooting.md](docs/troubleshooting.md).
